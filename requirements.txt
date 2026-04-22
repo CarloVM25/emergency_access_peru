@@ -1,0 +1,23 @@
+# emergency_access_peru — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Data manipulation
+pandas>=2.0
+numpy>=1.26
+
+# Geospatial
+geopandas>=1.0
+pyproj>=3.6
+shapely>=2.0
+pyogrio>=0.7        # default I/O engine for geopandas 1.x
+
+# Visualisation
+matplotlib>=3.8
+seaborn>=0.13
+folium>=0.17
+
+# Dashboard
+streamlit>=1.35
+
+# Excel I/O
+openpyxl>=3.1
