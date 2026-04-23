@@ -674,9 +674,550 @@ def plot_all() -> dict:
     return charts
 
 
+# ===========================================================================
+# Folium interactive maps
+# ===========================================================================
+
+import folium
+from folium.plugins import MarkerCluster, Fullscreen
+import branca.colormap as bcm
+
+# Peru map centre and default zoom
+_PERU_LAT, _PERU_LON, _PERU_ZOOM = -9.19, -74.99, 5
+
+# Colour scheme shared across Folium maps
+_FOLIUM_CAT_COLORS = {
+    "underserved":   "#d62728",
+    "below_average": "#ff7f0e",
+    "above_average": "#4e9ac4",
+    "well_served":   "#2ca02c",
+}
+_CHANGE_COLORS = {
+    "improved":  "#27ae60",   # green
+    "worsened":  "#c0392b",   # crimson
+    "unchanged": "#bdc3c7",   # grey
+}
+
+
+def _build_district_geojson(scores: pd.DataFrame,
+                             geodf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Merge scores into the district GeoDataFrame and return a simplified copy
+    ready for Folium.  Geometries are simplified (tolerance=0.01 deg) to keep
+    HTML file sizes manageable without losing district shape.
+    """
+    merge_cols = [
+        "iddist", "distrito", "departamen", "provincia",
+        "fac_count", "tot_atend", "ccpp_count", "avg_dist_km",
+        "baseline_index", "baseline_category",
+        "alt_index", "alt_category",
+    ]
+    score_sub = scores[merge_cols].copy()
+    score_sub["iddist"] = pd.to_numeric(score_sub["iddist"], errors="coerce")
+
+    gdf = geodf[["iddist", "geometry"]].merge(score_sub, on="iddist", how="left")
+
+    # Round floats to reduce file size
+    for col in ["baseline_index", "alt_index", "avg_dist_km"]:
+        gdf[col] = gdf[col].round(2)
+
+    # Simplify geometry for web rendering (~30 % file-size reduction)
+    gdf = gdf.copy()
+    gdf["geometry"] = gdf["geometry"].simplify(0.01, preserve_topology=True)
+
+    return gdf
+
+
+def _add_folium_controls(m: folium.Map) -> None:
+    """Add fullscreen button and layer control to a map."""
+    Fullscreen(position="topright").add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+
+def _html_path(filename: str) -> str:
+    os.makedirs(FIGURES_DIR, exist_ok=True)
+    return os.path.join(FIGURES_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Folium Map 1 — Interactive choropleth by baseline_index
+# ---------------------------------------------------------------------------
+
+def create_folium_choropleth(scores: pd.DataFrame = None,
+                              geodf: gpd.GeoDataFrame = None) -> folium.Map:
+    """
+    Interactive choropleth of Peru districts coloured by baseline_index.
+
+    Answers Q1 (interactive version): How does emergency access vary
+    spatially, and what are the exact scores for each district?
+
+    Design choices
+    --------------
+    - GeoJson with a lambda style_function is used instead of
+      folium.Choropleth because Choropleth does not support custom
+      GeoJsonTooltip fields without a workaround.
+    - branca LinearColormap provides a continuous colour gradient
+      (YlOrRd) with a legend automatically rendered in the map.
+    - Geometries are simplified (tolerance=0.01 deg) to keep file
+      size under ~5 MB while preserving district shapes.
+    - Two feature groups (scored / unscored districts) allow the
+      reader to hide districts with no data via the layer control.
+    - Tooltips show all six key attributes so the map is self-
+      contained without needing to cross-reference the CSV.
+
+    Saved to output/figures/folium_choropleth.html.
+    """
+    if scores is None:
+        scores = _load_scores()
+    if geodf is None:
+        geodf = _load_geodataframe()
+
+    gdf = _build_district_geojson(scores, geodf)
+
+    # Build colormap over the non-null range
+    valid_idx  = gdf["baseline_index"].dropna()
+    colormap   = bcm.LinearColormap(
+        colors=["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"],
+        vmin=valid_idx.min(),
+        vmax=valid_idx.max(),
+        caption="Baseline Emergency Access Index",
+    )
+
+    m = folium.Map(
+        location=[_PERU_LAT, _PERU_LON],
+        zoom_start=_PERU_ZOOM,
+        tiles="CartoDB positron",
+    )
+    colormap.add_to(m)
+
+    # Scored districts layer
+    scored_group   = folium.FeatureGroup(name="Districts (scored)", show=True)
+    unscored_group = folium.FeatureGroup(name="Districts (no data)", show=True)
+
+    def _style(feature):
+        val = feature["properties"].get("baseline_index")
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return {"fillColor": "#cccccc", "color": "white",
+                    "weight": 0.4, "fillOpacity": 0.6}
+        return {"fillColor": colormap(val), "color": "white",
+                "weight": 0.4, "fillOpacity": 0.75}
+
+    def _highlight(feature):
+        return {"weight": 2, "color": "#333333", "fillOpacity": 0.9}
+
+    tooltip_fields   = ["distrito", "departamen", "provincia",
+                        "baseline_index", "baseline_category",
+                        "alt_index", "alt_category",
+                        "fac_count", "avg_dist_km"]
+    tooltip_aliases  = ["District:", "Department:", "Province:",
+                        "Baseline index:", "Baseline category:",
+                        "Alternative index:", "Alternative category:",
+                        "Facilities:", "Avg dist to emerg. fac. (km):"]
+
+    # Split into scored and unscored for layer control
+    gdf_scored   = gdf[gdf["baseline_index"].notna()]
+    gdf_unscored = gdf[gdf["baseline_index"].isna()]
+
+    for sub_gdf, group in [(gdf_scored, scored_group),
+                            (gdf_unscored, unscored_group)]:
+        if sub_gdf.empty:
+            continue
+        folium.GeoJson(
+            sub_gdf.__geo_interface__,
+            style_function=_style,
+            highlight_function=_highlight,
+            tooltip=folium.GeoJsonTooltip(
+                fields=tooltip_fields,
+                aliases=tooltip_aliases,
+                localize=True,
+                sticky=False,
+                labels=True,
+                style=(
+                    "background-color: white; color: #333333; "
+                    "font-family: arial; font-size: 12px; padding: 8px;"
+                ),
+            ),
+        ).add_to(group)
+
+    scored_group.add_to(m)
+    unscored_group.add_to(m)
+
+    # Legend for categories
+    legend_html = """
+    <div style="position:fixed; bottom:30px; left:30px; z-index:1000;
+                background:white; padding:10px 14px; border-radius:6px;
+                border:1px solid #ccc; font-family:arial; font-size:12px;">
+      <b>Access Category</b><br>
+      <span style="background:{us};width:12px;height:12px;display:inline-block;margin-right:6px;border-radius:2px;"></span>Underserved<br>
+      <span style="background:{ba};width:12px;height:12px;display:inline-block;margin-right:6px;border-radius:2px;"></span>Below average<br>
+      <span style="background:{aa};width:12px;height:12px;display:inline-block;margin-right:6px;border-radius:2px;"></span>Above average<br>
+      <span style="background:{ws};width:12px;height:12px;display:inline-block;margin-right:6px;border-radius:2px;"></span>Well served<br>
+    </div>
+    """.format(
+        us=_FOLIUM_CAT_COLORS["underserved"],
+        ba=_FOLIUM_CAT_COLORS["below_average"],
+        aa=_FOLIUM_CAT_COLORS["above_average"],
+        ws=_FOLIUM_CAT_COLORS["well_served"],
+    )
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    _add_folium_controls(m)
+
+    path = _html_path("folium_choropleth.html")
+    m.save(path)
+    print(f"  Saved -> {path}")
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Folium Map 2 — Health facility locations
+# ---------------------------------------------------------------------------
+
+def create_folium_facilities_map(scores: pd.DataFrame = None) -> folium.Map:
+    """
+    Interactive point map of all 7,953 IPRESS health facilities.
+
+    Answers Q3 (interactive version): Where exactly are health facilities
+    located?  Are emergency-capable facilities concentrated in urban centres?
+
+    Design choices
+    --------------
+    - Emergency-capable facilities (633) are rendered as individual
+      CircleMarkers — they are few enough to show one-by-one and their
+      locations are the primary analytical interest.
+    - Regular primary-care facilities (7,320) use MarkerCluster so the
+      map remains interactive at the national zoom level without freezing
+      the browser; clusters dissolve on zoom.
+    - Two separate FeatureGroups allow the reader to toggle each layer
+      independently via the built-in LayerControl.
+    - Popups include the facility name, category, classification, and
+      district so the map is self-contained.
+    - CartoDB positron tiles provide a clean, low-contrast basemap that
+      does not compete visually with the coloured markers.
+
+    Saved to output/figures/folium_facilities.html.
+    """
+    if scores is None:
+        scores = _load_scores()
+
+    ipress_path = os.path.join(PROCESSED_DIR, "ipress_clean.csv")
+    ipress = pd.read_csv(ipress_path)
+
+    # Classify facilities
+    EMERG_CATS = {"II-1", "II-2", "III-1", "III-2", "II-E", "III-E"}
+    EMERG_TIPO = "ESTABLECIMIENTO DE SALUD CON INTERNAMIENTO"
+    ipress["is_emergency"] = (
+        ipress["tipo"].eq(EMERG_TIPO) |
+        ipress["categoria"].isin(EMERG_CATS)
+    )
+
+    # Join district name from scores via ubigeo = iddist
+    ubigeo_to_dist = (
+        scores[["iddist", "distrito", "departamen"]]
+        .assign(iddist=lambda d: pd.to_numeric(d["iddist"], errors="coerce"))
+        .drop_duplicates("iddist")
+    )
+    ipress["ubigeo_int"] = pd.to_numeric(ipress["ubigeo"], errors="coerce")
+    ipress = ipress.merge(
+        ubigeo_to_dist.rename(columns={"iddist": "ubigeo_int",
+                                        "distrito": "dist_name",
+                                        "departamen": "dept_name"}),
+        on="ubigeo_int", how="left",
+    )
+
+    m = folium.Map(
+        location=[_PERU_LAT, _PERU_LON],
+        zoom_start=_PERU_ZOOM,
+        tiles="CartoDB positron",
+    )
+
+    # --- Emergency-capable facilities (individual markers) ---
+    emerg_group = folium.FeatureGroup(
+        name=f"Emergency-capable facilities ({ipress['is_emergency'].sum():,})",
+        show=True,
+    )
+    for _, row in ipress[ipress["is_emergency"]].iterrows():
+        popup_html = (
+            f"<div style='font-family:arial;font-size:12px;min-width:200px'>"
+            f"<b>{row['nombre_del_establecimiento'].title()}</b><br>"
+            f"<b>Category:</b> {row['categoria']}<br>"
+            f"<b>Type:</b> {row['tipo']}<br>"
+            f"<b>District:</b> {str(row.get('dist_name','')).title()}<br>"
+            f"<b>Department:</b> {str(row.get('dept_name','')).title()}<br>"
+            f"<b>Institution:</b> {row['institucion']}<br>"
+            f"<b>Beds:</b> {int(row['camas']) if pd.notna(row['camas']) else 'N/A'}<br>"
+            f"</div>"
+        )
+        folium.CircleMarker(
+            location=[row["lat"], row["lon"]],
+            radius=6,
+            color="#8b0000",
+            fill=True,
+            fill_color="#e74c3c",
+            fill_opacity=0.85,
+            weight=1.5,
+            popup=folium.Popup(popup_html, max_width=260),
+            tooltip=f"{row['nombre_del_establecimiento'].title()} [{row['categoria']}]",
+        ).add_to(emerg_group)
+    emerg_group.add_to(m)
+
+    # --- Regular primary-care facilities (clustered) ---
+    regular_group   = folium.FeatureGroup(
+        name=f"Primary-care facilities ({(~ipress['is_emergency']).sum():,}  — clustered)",
+        show=True,
+    )
+    cluster = MarkerCluster(
+        options={
+            "maxClusterRadius": 40,
+            "disableClusteringAtZoom": 10,
+        }
+    ).add_to(regular_group)
+
+    for _, row in ipress[~ipress["is_emergency"]].iterrows():
+        popup_html = (
+            f"<div style='font-family:arial;font-size:12px;min-width:200px'>"
+            f"<b>{row['nombre_del_establecimiento'].title()}</b><br>"
+            f"<b>Category:</b> {row['categoria']}<br>"
+            f"<b>District:</b> {str(row.get('dist_name','')).title()}<br>"
+            f"<b>Department:</b> {str(row.get('dept_name','')).title()}<br>"
+            f"<b>Institution:</b> {row['institucion']}<br>"
+            f"</div>"
+        )
+        folium.CircleMarker(
+            location=[row["lat"], row["lon"]],
+            radius=4,
+            color="#1a5276",
+            fill=True,
+            fill_color="#4e9ac4",
+            fill_opacity=0.7,
+            weight=1,
+            popup=folium.Popup(popup_html, max_width=260),
+            tooltip=f"{row['nombre_del_establecimiento'].title()} [{row['categoria']}]",
+        ).add_to(cluster)
+
+    regular_group.add_to(m)
+
+    # Legend
+    legend_html = """
+    <div style="position:fixed; bottom:30px; left:30px; z-index:1000;
+                background:white; padding:10px 14px; border-radius:6px;
+                border:1px solid #ccc; font-family:arial; font-size:12px;">
+      <b>Facility type</b><br>
+      <span style="background:#e74c3c;width:12px;height:12px;display:inline-block;
+            margin-right:6px;border-radius:50%;"></span>Emergency-capable (cat. II / III)<br>
+      <span style="background:#4e9ac4;width:12px;height:12px;display:inline-block;
+            margin-right:6px;border-radius:50%;"></span>Primary care (cat. I  — clustered)<br>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    _add_folium_controls(m)
+
+    path = _html_path("folium_facilities.html")
+    m.save(path)
+    print(f"  Saved -> {path}")
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Folium Map 3 — Category change comparison map
+# ---------------------------------------------------------------------------
+
+def create_folium_comparison_map(scores: pd.DataFrame = None,
+                                  geodf: gpd.GeoDataFrame = None) -> folium.Map:
+    """
+    Layered map showing which districts change access category between the
+    baseline and alternative index specifications.
+
+    Answers Q5 (interactive version): Where on the map are the districts
+    most sensitive to the weighting choice?  Are there spatial clusters of
+    districts that improve or worsen under the distance-heavy alternative?
+
+    Design choices
+    --------------
+    - Three FeatureGroups (improved / worsened / unchanged) let the reader
+      isolate each group or show them all together.  A single layer with a
+      categorical colour scheme was considered but makes it hard to focus on
+      one group at a time.
+    - 'Improved' districts (better category under alt spec) are shown in
+      green; 'worsened' in red — the same colour semantics used in the
+      static stacked-bar chart (Chart 5).
+    - Unchanged districts are shown in light grey with reduced opacity
+      so they provide geographic context without dominating the view.
+    - Tooltips for changed districts include both the baseline and
+      alternative category plus a plain-English description of the change,
+      so the map is self-explanatory without a legend table.
+    - Geometries are simplified (tolerance=0.01) as in the other maps.
+
+    Saved to output/figures/folium_comparison.html.
+    """
+    if scores is None:
+        scores = _load_scores()
+    if geodf is None:
+        geodf = _load_geodataframe()
+
+    # Assign numeric rank for comparison
+    cat_rank = {c: i for i, c in enumerate(CAT_ORDER)}
+    df = scores.copy()
+    df["base_rank"] = df["baseline_category"].map(cat_rank)
+    df["alt_rank"]  = df["alt_category"].map(cat_rank)
+    df["change"] = "unchanged"
+    df.loc[df["alt_rank"] > df["base_rank"], "change"] = "improved"
+    df.loc[df["alt_rank"] < df["base_rank"], "change"] = "worsened"
+
+    n_improved  = (df["change"] == "improved").sum()
+    n_worsened  = (df["change"] == "worsened").sum()
+    n_unchanged = (df["change"] == "unchanged").sum()
+
+    # Build GeoDataFrame
+    merge_cols = [
+        "iddist", "distrito", "departamen", "provincia",
+        "baseline_index", "baseline_category",
+        "alt_index", "alt_category", "change",
+    ]
+    score_sub = df[merge_cols].copy()
+    score_sub["iddist"] = pd.to_numeric(score_sub["iddist"], errors="coerce")
+
+    gdf = geodf[["iddist", "geometry"]].merge(score_sub, on="iddist", how="left")
+    gdf["baseline_index"] = gdf["baseline_index"].round(2)
+    gdf["alt_index"]      = gdf["alt_index"].round(2)
+    gdf["change"]         = gdf["change"].fillna("unchanged")
+    gdf["geometry"]       = gdf["geometry"].simplify(0.01, preserve_topology=True)
+
+    m = folium.Map(
+        location=[_PERU_LAT, _PERU_LON],
+        zoom_start=_PERU_ZOOM,
+        tiles="CartoDB positron",
+    )
+
+    # Three groups with distinct colours
+    group_configs = [
+        ("improved",  f"Improved under alt spec ({n_improved:,})",  True),
+        ("worsened",  f"Worsened under alt spec ({n_worsened:,})",  True),
+        ("unchanged", f"No category change ({n_unchanged:,})",       True),
+    ]
+
+    for change_val, group_name, show in group_configs:
+        group   = folium.FeatureGroup(name=group_name, show=show)
+        sub_gdf = gdf[gdf["change"] == change_val]
+
+        fill_color   = _CHANGE_COLORS[change_val]
+        fill_opacity = 0.25 if change_val == "unchanged" else 0.72
+        weight       = 0.3  if change_val == "unchanged" else 0.5
+
+        def _make_style(fc=fill_color, fo=fill_opacity, w=weight):
+            def _style(feature):
+                return {
+                    "fillColor":   fc,
+                    "color":       "white" if w < 0.4 else "#555",
+                    "weight":      w,
+                    "fillOpacity": fo,
+                }
+            return _style
+
+        def _make_highlight(fc=fill_color):
+            def _highlight(feature):
+                return {"weight": 2, "color": "#222", "fillOpacity": 0.9,
+                        "fillColor": fc}
+            return _highlight
+
+        # Tooltip fields depend on whether the district changed
+        if change_val != "unchanged":
+            tt_fields   = ["distrito", "departamen",
+                           "baseline_category", "alt_category",
+                           "baseline_index", "alt_index"]
+            tt_aliases  = ["District:", "Department:",
+                           "Baseline category:", "Alternative category:",
+                           "Baseline index:", "Alternative index:"]
+        else:
+            tt_fields   = ["distrito", "departamen", "baseline_category", "baseline_index"]
+            tt_aliases  = ["District:", "Department:", "Category:", "Index:"]
+
+        if not sub_gdf.empty:
+            folium.GeoJson(
+                sub_gdf.__geo_interface__,
+                style_function=_make_style(),
+                highlight_function=_make_highlight(),
+                tooltip=folium.GeoJsonTooltip(
+                    fields=tt_fields,
+                    aliases=tt_aliases,
+                    localize=True,
+                    sticky=False,
+                    style=(
+                        "background-color: white; color: #333; "
+                        "font-family: arial; font-size: 12px; padding: 8px;"
+                    ),
+                ),
+            ).add_to(group)
+
+        group.add_to(m)
+
+    # Legend
+    legend_html = """
+    <div style="position:fixed; bottom:30px; left:30px; z-index:1000;
+                background:white; padding:10px 14px; border-radius:6px;
+                border:1px solid #ccc; font-family:arial; font-size:12px;">
+      <b>Category change: baseline vs alternative</b><br>
+      <span style="background:{imp};width:12px;height:12px;display:inline-block;
+            margin-right:6px;border-radius:2px;"></span>Improved (better category in alt spec)<br>
+      <span style="background:{wor};width:12px;height:12px;display:inline-block;
+            margin-right:6px;border-radius:2px;"></span>Worsened (worse category in alt spec)<br>
+      <span style="background:{unc};width:12px;height:12px;display:inline-block;
+            margin-right:6px;border-radius:2px;opacity:0.5;"></span>No change<br>
+      <br><small>Alt spec: 25% facility | 25% activity | 50% distance</small>
+    </div>
+    """.format(
+        imp=_CHANGE_COLORS["improved"],
+        wor=_CHANGE_COLORS["worsened"],
+        unc=_CHANGE_COLORS["unchanged"],
+    )
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    _add_folium_controls(m)
+
+    path = _html_path("folium_comparison.html")
+    m.save(path)
+    print(f"  Saved -> {path}")
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Run all Folium maps
+# ---------------------------------------------------------------------------
+
+def create_all_folium_maps() -> dict:
+    """
+    Generate all three Folium interactive maps, loading data once.
+
+    Returns
+    -------
+    dict mapping map name to folium.Map instance.
+    """
+    print("\n[folium] Loading data ...")
+    scores = _load_scores()
+    geodf  = _load_geodataframe()
+    print(f"  Scores : {len(scores):,} districts")
+    print(f"  GeoDF  : {len(geodf):,} polygons")
+
+    maps = {}
+
+    print("\n[1/3] Choropleth (baseline_index) ...")
+    maps["choropleth"] = create_folium_choropleth(scores, geodf)
+
+    print("[2/3] Facilities map ...")
+    maps["facilities"] = create_folium_facilities_map(scores)
+
+    print("[3/3] Category comparison map ...")
+    maps["comparison"] = create_folium_comparison_map(scores, geodf)
+
+    print(f"\n[folium] Done. All maps saved to: {FIGURES_DIR}")
+    return maps
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     plot_all()
+    create_all_folium_maps()
