@@ -1,23 +1,27 @@
 # emergency_access_peru — Python dependencies
 # Install with: pip install -r requirements.txt
+# Versions reflect the environment used to develop and test this project.
+# Lower bounds allow minor upgrades; upper bounds prevent breaking changes.
 
-# Data manipulation
-pandas>=2.0
-numpy>=1.26
+# ── Data manipulation ──────────────────────────────────────────────────────
+numpy>=2.0,<3.0
+pandas>=2.0,<3.0
 
-# Geospatial
-geopandas>=1.0
-pyproj>=3.6
-shapely>=2.0
-pyogrio>=0.7        # default I/O engine for geopandas 1.x
+# ── Geospatial ─────────────────────────────────────────────────────────────
+shapely>=2.0,<3.0
+pyproj>=3.6,<4.0
+fiona>=1.9,<2.0          # optional shapefile I/O backend for geopandas
+pyogrio>=0.7,<1.0        # default I/O engine for geopandas >= 1.0
+geopandas>=1.0,<2.0
 
-# Visualisation
-matplotlib>=3.8
-seaborn>=0.13
-folium>=0.17
+# ── Visualisation ──────────────────────────────────────────────────────────
+matplotlib>=3.8,<4.0
+seaborn>=0.13,<1.0
+branca>=0.7,<1.0         # colormap and HTML elements for folium
+folium>=0.17,<1.0
 
-# Dashboard
-streamlit>=1.35
+# ── Dashboard ──────────────────────────────────────────────────────────────
+streamlit>=1.35,<2.0
 
-# Excel I/O
-openpyxl>=3.1
+# ── Excel I/O ──────────────────────────────────────────────────────────────
+openpyxl>=3.1,<4.0
